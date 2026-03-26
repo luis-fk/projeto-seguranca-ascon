@@ -24,8 +24,10 @@ esp_now_peer_info_t peerInfo;
 // Chave secreta (k) de 16 bytes. NUNCA use chave fixa em produção!
 unsigned char key[ASCON128_KEY_SIZE];
 
+// Contador de mensagens para gerar nonces únicos. Será persistido na NVS.
+uint32_t message_counter;
+
 // Nonce público (npub) de 16 bytes. NUNCA REUTILIZE o mesmo nonce com a mesma chave.
-// Vamos torná-lo uma variável para que possamos incrementá-lo a cada envio.
 unsigned char nonce[ASCON128_NONCE_SIZE] = {
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
     0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
@@ -34,17 +36,6 @@ unsigned char nonce[ASCON128_NONCE_SIZE] = {
 // Dados Associados (AD) - Metadados protegidos contra alteração, mas não ocultos.
 const unsigned char associated_data[] = {0xDE, 0xAD, 0xBE, 0xEF};
 const size_t ad_len = sizeof(associated_data);
-
-// Função para incrementar o nonce.
-// Uma forma simples é tratar os últimos 4 bytes como um contador.
-void increment_nonce() {
-    for (int i = ASCON128_NONCE_SIZE - 1; i >= 12; --i) {
-        if (++nonce[i] != 0) {
-            break; // Se o byte não estourou (não virou 0), podemos parar.
-        }
-        // Se estourou (virou 0), o loop continua para incrementar o próximo byte (carry).
-    }
-}
 
 // Função auxiliar para imprimir bytes em formato hexadecimal no Monitor Serial
 void print_hex(const char* label, const unsigned char* data, size_t len) {
@@ -70,7 +61,20 @@ void setup() {
         Serial.println("ERRO FATAL: Chave não encontrada na NVS. Rode o script gravador!");
         while(true); // Trava o sistema por segurança
     }
-    Serial.println("Chave carregada da memória segura com sucesso.");
+    Serial.println("Chave carregada da memória com sucesso.");
+
+    // --- INICIALIZAÇÃO DO CONTADOR DE MENSAGENS (PARA O NONCE) ---
+    preferences.begin("msg_cnt", false); // Abre no modo Leitura/Escrita
+    
+    // Lê o último contador salvo. Se não existir, começa em 0.
+    uint32_t last_counter = preferences.getUInt("msg_cnt", 0);
+    
+    // Aplica uma margem de segurança para evitar reutilização de nonce em caso de reset.
+    // A margem de segurança (100) deve ser igual ou maior que o intervalo de salvamento (a cada 100 mensagens).
+    // Isso garante que, em caso de reset, o novo contador comece após o último nonce possivelmente usado.
+    message_counter = last_counter + 100; 
+    Serial.printf("Contador recuperado: %u. Iniciando a partir de: %u\n", last_counter, message_counter);
+    preferences.end();
 
     // --- INICIALIZAÇÃO DO ESP-NOW ---
     // Coloca o ESP32 em modo Station (necessário para o ESP-NOW)
@@ -100,10 +104,12 @@ void loop() {
     const unsigned char* plaintext = (const unsigned char*)sensor_reading_str;
     const size_t plaintext_len = strlen(sensor_reading_str);
 
-    // IMPORTANTE: Incrementar o nonce ANTES de cada criptografia para garantir que ele seja único.
-    increment_nonce();
+    // IMPORTANTE: Atualizar o nonce ANTES de cada criptografia para garantir que ele seja único.
+    // Incrementamos nosso contador e o copiamos para a parte final do array do nonce.
+    message_counter++;
+    memcpy(nonce + 12, &message_counter, sizeof(message_counter));
 
-    Serial.printf("Payload original (PT): %s\n", sensor_reading_str);
+    Serial.printf("\nPayload original (PT): %s\n", sensor_reading_str);
 
     // 2. CRIPTOGRAFIA E MONTAGEM DO PACOTE
     // O pacote final terá o formato: [ 16 bytes de Nonce | Ciphertext + Tag ]
@@ -144,6 +150,14 @@ void loop() {
         Serial.println("Comando de envio acionado com sucesso.");
     } else {
         Serial.println("Erro ao enviar o pacote.");
+    }
+
+    // Persiste o contador na NVS periodicamente para reduzir o desgaste da flash.
+    if (message_counter % 100 == 0) {
+        preferences.begin("msg_cnt", false);
+        preferences.putUInt("msg_cnt", message_counter);
+        preferences.end();
+        Serial.printf("-> Contador de mensagens (%u) salvo na NVS.\n", message_counter);
     }
 
     delay(5000);
